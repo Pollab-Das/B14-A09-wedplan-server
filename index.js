@@ -520,7 +520,7 @@ app.patch("/services/:id/status", verifyToken, verifyRole(["admin"]), asyncHandl
   const updated = await collections.services.findOne({ _id: service._id });
   return res.json(updated);
 }));
-// BOOKINGS
+// BOOKINGS-->
 app.post("/bookings", verifyToken, verifyRole(["customer"]), asyncHandler(async (req, res) => {
   const { serviceId, eventDate, eventLocation, message } = req.body || {};
   if (!isValidObjectId(serviceId)) return jsonError(res, 400, "Invalid serviceId");
