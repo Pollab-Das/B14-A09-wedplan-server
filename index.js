@@ -344,7 +344,8 @@ app.use((req, res, next) => {
 });
 
 app.get("/", (req, res) => res.json({ ok: true, message: "VowVista API is running" }));
-// SERVICES
+
+// SERVICES-->
 app.get("/services", asyncHandler(async (req, res) => {
   const { search, category, location, sort } = req.query;
   const query = { status: "approved", isActive: true };
