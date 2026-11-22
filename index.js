@@ -252,11 +252,9 @@ async function fulfillSubscriptionSession(session, eventId) {
   if (!isNonEmptyString(vendorId, 200)) return { ok: false, reason: "missing metadata.vendorId" };
 
   const user = await findUserById(vendorId.trim());
-  if (!user) return { ok: false, reason: `vendor not found: ${vendorId}` };
-
   const now = new Date();
-  const vendorIdString = asIdString(user._id);
-  const previousExpiry = isPremiumActive(user) ? new Date(user.subscriptionExpiresAt).getTime() : now.getTime();
+  const vendorIdString = user ? asIdString(user._id) : vendorId.trim();
+  const previousExpiry = user && isPremiumActive(user) ? new Date(user.subscriptionExpiresAt).getTime() : now.getTime();
   const expiresAt = new Date(Math.max(previousExpiry, now.getTime()) + THIRTY_DAYS_MS);
 
   try {
@@ -293,23 +291,47 @@ async function fulfillSubscriptionSession(session, eventId) {
       { upsert: true }
     );
 
-    await collections.users.updateOne(
-      { _id: user._id },
-      {
-        $set: {
-          subscriptionPlan: "premium",
-          stripeCustomerId: session.customer || user.stripeCustomerId || null,
-        },
-        $max: { subscriptionExpiresAt: expiresAt },
-        $setOnInsert: { premiumActivatedAt: now },
-      }
-    );
+    if (user) {
+      await collections.users.updateOne(
+        { _id: user._id },
+        {
+          $set: {
+            subscriptionPlan: "premium",
+            stripeCustomerId: session.customer || user.stripeCustomerId || null,
+          },
+          $max: { subscriptionExpiresAt: expiresAt },
+          $setOnInsert: { premiumActivatedAt: now },
+        }
+      );
+    }
 
-    return { ok: true, stripeSessionId, vendorId: vendorIdString, expiresAt };
+    return { ok: true, stripeSessionId, vendorId: vendorIdString, expiresAt, vendorFound: Boolean(user) };
   } catch (err) {
     await collections.paymentFulfillments.deleteOne({ _id: stripeSessionId });
     throw err;
   }
+}
+
+async function backfillPaidSessions() {
+  if (!stripe) throw new Error("Stripe is not configured");
+  let startingAfter;
+  let created = 0;
+  let skipped = 0;
+  for (;;) {
+    const page = await stripe.checkout.sessions.list({
+      limit: 100,
+      ...(startingAfter ? { starting_after: startingAfter } : {}),
+    });
+    for (const session of page.data) {
+      if (!isCompletedCheckoutSession(session)) continue;
+      const result = await fulfillSubscriptionSession(session, `backfill:${session.id}`);
+      if (result.ok && !result.duplicate) created += 1;
+      else skipped += 1;
+    }
+    if (!page.has_more) break;
+    startingAfter = page.data[page.data.length - 1].id;
+  }
+  return { created, skipped };
 }
 
 app.use(express.json({ limit: "1mb" }));
@@ -744,6 +766,12 @@ app.use((err, req, res, next) => {
 
 async function startServer() {
   await connectDB();
+  if (process.env.BACKFILL_PAYMENTS === "1") {
+    const result = await backfillPaidSessions();
+    console.log("Payment backfill:", result);
+    await client.close();
+    process.exit(0);
+  }
   console.log(`Stripe webhook secret configured: ${Boolean(process.env.STRIPE_WEBHOOK_SECRET)}`);
   app.listen(port, () => console.log(`VowVista server running on port ${port}`));
 }
