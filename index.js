@@ -193,26 +193,38 @@ function sanitizeUser(user) {
 
 async function connectDB() {
   await client.connect();
-  const db = client.db(process.env.DB_NAME || "vowvista");
+  const dbName = process.env.DB_NAME || process.env.MONGODB_DB_NAME || "wedplan";
+  const db = client.db(dbName);
   collections = {
     users: db.collection("user"),
     sessions: db.collection("session"),
     services: db.collection("services"),
     bookings: db.collection("bookings"),
     transactions: db.collection("transactions"),
+    paymentFulfillments: db.collection("paymentFulfillments"),
   };
 
   await collections.services.createIndex({ status: 1, isActive: 1, createdAt: -1 });
   await collections.bookings.createIndex({ serviceId: 1, eventDate: 1, status: 1 });
   await collections.transactions.createIndex({ stripeSessionId: 1 }, { unique: true, sparse: true });
-  console.log("Connected to MongoDB");
+  console.log(`Connected to MongoDB (db: ${dbName})`);
+}
+
+const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+
+function isCompletedCheckoutSession(session) {
+  if (!session || typeof session !== "object" || !session.id) return false;
+  if (session.status && session.status !== "complete") return false;
+  if (session.payment_status && !["paid", "no_payment_required"].includes(session.payment_status)) return false;
+  return true;
 }
 
 // Stripe webhook must be before express.json
-app.post("/payments/webhook", express.raw({ type: "application/json" }), asyncHandler(async (req, res) => {
+app.post("/payments/webhook", express.raw({ type: () => true }), asyncHandler(async (req, res) => {
   if (!ensureStripe(res)) return;
   const sig = req.headers["stripe-signature"];
   if (!sig || !process.env.STRIPE_WEBHOOK_SECRET) {
+    console.warn("Webhook rejected: missing stripe-signature or STRIPE_WEBHOOK_SECRET");
     return jsonError(res, 400, "Missing Stripe signature or webhook secret");
   }
 
@@ -220,58 +232,84 @@ app.post("/payments/webhook", express.raw({ type: "application/json" }), asyncHa
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
+    console.warn(`Webhook signature verification failed: ${err.message}`);
     return jsonError(res, 400, `Webhook signature verification failed: ${err.message}`);
   }
 
   if (event.type === "checkout.session.completed") {
-    const session = event.data.object;
-    await fulfillSubscriptionSession(session, event.id);
+    const result = await fulfillSubscriptionSession(event.data.object, event.id);
+    console.log("checkout.session.completed fulfillment:", result);
   }
 
   return res.status(200).json({ received: true });
 }));
 
 async function fulfillSubscriptionSession(session, eventId) {
-  const vendorId = session?.metadata?.vendorId;
-  if (!isValidObjectId(vendorId)) return;
+  if (!isCompletedCheckoutSession(session)) return { ok: false, reason: "session is not completed/paid" };
 
   const stripeSessionId = session.id;
-  const existingTx = await collections.transactions.findOne({ stripeSessionId });
-  if (!existingTx) {
-    try {
-      await collections.transactions.insertOne({
-        vendorId,
-        plan: "premium",
-        amount: typeof session.amount_total === "number" ? session.amount_total / 100 : 0,
-        currency: (session.currency || "usd").toUpperCase(),
-        stripeSessionId,
-        stripeSubscriptionId: session.subscription || null,
-        stripeEventId: eventId || null,
-        status: "success",
-        createdAt: new Date(),
-        immutable: true,
-      });
-    } catch (err) {
-      if (!(err?.code === 11000)) throw err;
-    }
+  const vendorId = session?.metadata?.vendorId;
+  if (!isNonEmptyString(vendorId, 200)) return { ok: false, reason: "missing metadata.vendorId" };
+
+  const user = await findUserById(vendorId.trim());
+  if (!user) return { ok: false, reason: `vendor not found: ${vendorId}` };
+
+  const now = new Date();
+  const vendorIdString = asIdString(user._id);
+  const previousExpiry = isPremiumActive(user) ? new Date(user.subscriptionExpiresAt).getTime() : now.getTime();
+  const expiresAt = new Date(Math.max(previousExpiry, now.getTime()) + THIRTY_DAYS_MS);
+
+  try {
+    await collections.paymentFulfillments.insertOne({
+      _id: stripeSessionId,
+      vendorId: vendorIdString,
+      createdAt: now,
+      expiresAt,
+      eventId: eventId || null,
+    });
+  } catch (err) {
+    if (err?.code === 11000) return { ok: true, duplicate: true, stripeSessionId };
+    throw err;
   }
 
-  const expiryDate = new Date();
-  expiryDate.setDate(expiryDate.getDate() + 30);
-
-  const user = await findUserById(vendorId);
-  if (!user) return;
-  await collections.users.updateOne(
-    { _id: user._id },
-    {
-      $set: {
-        subscriptionPlan: "premium",
-        subscriptionExpiresAt: expiryDate,
-        premiumActivatedAt: new Date(),
-        stripeCustomerId: session.customer || user.stripeCustomerId || null,
+  try {
+    await collections.transactions.updateOne(
+      { stripeSessionId },
+      {
+        $setOnInsert: {
+          vendorId: vendorIdString,
+          plan: "premium",
+          amount: typeof session.amount_total === "number" ? session.amount_total / 100 : 0,
+          currency: (session.currency || "usd").toUpperCase(),
+          stripeSessionId,
+          stripeSubscriptionId: session.subscription || null,
+          stripeEventId: eventId || null,
+          status: "success",
+          createdAt: now,
+          expiresAt,
+          immutable: true,
+        },
       },
-    }
-  );
+      { upsert: true }
+    );
+
+    await collections.users.updateOne(
+      { _id: user._id },
+      {
+        $set: {
+          subscriptionPlan: "premium",
+          stripeCustomerId: session.customer || user.stripeCustomerId || null,
+        },
+        $max: { subscriptionExpiresAt: expiresAt },
+        $setOnInsert: { premiumActivatedAt: now },
+      }
+    );
+
+    return { ok: true, stripeSessionId, vendorId: vendorIdString, expiresAt };
+  } catch (err) {
+    await collections.paymentFulfillments.deleteOne({ _id: stripeSessionId });
+    throw err;
+  }
 }
 
 app.use(express.json({ limit: "1mb" }));
@@ -657,6 +695,35 @@ app.post("/payments/create-checkout-session", verifyToken, verifyRole(["vendor"]
   return res.json({ url: session.url, sessionId: session.id });
 }));
 
+app.post("/payments/verify-session", verifyToken, verifyRole(["vendor", "admin"]), asyncHandler(async (req, res) => {
+  if (!ensureStripe(res)) return;
+  const sessionId = req.body?.sessionId;
+  if (!isNonEmptyString(sessionId, 200)) return jsonError(res, 400, "Invalid sessionId");
+
+  const session = await stripe.checkout.sessions.retrieve(sessionId);
+  if (!isCompletedCheckoutSession(session)) return jsonError(res, 400, "Stripe session is not completed/paid");
+
+  const vendorId = session?.metadata?.vendorId;
+  if (!isNonEmptyString(vendorId, 200)) return jsonError(res, 400, "Stripe session is missing vendorId metadata");
+  if (req.user.role === "vendor" && !sameId(vendorId, req.user._id)) {
+    return jsonError(res, 403, "Session does not belong to the authenticated vendor");
+  }
+
+  const result = await fulfillSubscriptionSession(session, `verify:${session.id}`);
+  if (!result.ok) return jsonError(res, 400, result.reason || "Unable to fulfill session");
+
+  const user = await findUserById(vendorId);
+  const transaction = await collections.transactions.findOne({ stripeSessionId: session.id });
+  return res.json({
+    ok: true,
+    sessionId: session.id,
+    duplicate: Boolean(result.duplicate),
+    subscriptionPlan: user?.subscriptionPlan || "premium",
+    subscriptionExpiresAt: user?.subscriptionExpiresAt || null,
+    transaction,
+  });
+}));
+
 //Protect transaction immutability at API layer
 app.all("/admin/transactions/:id", verifyToken, verifyRole(["admin"]), (req, res) => {
   return jsonError(res, 405, "Transactions are immutable");
@@ -677,6 +744,7 @@ app.use((err, req, res, next) => {
 
 async function startServer() {
   await connectDB();
+  console.log(`Stripe webhook secret configured: ${Boolean(process.env.STRIPE_WEBHOOK_SECRET)}`);
   app.listen(port, () => console.log(`VowVista server running on port ${port}`));
 }
 
