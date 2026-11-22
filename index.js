@@ -657,7 +657,7 @@ app.post("/payments/create-checkout-session", verifyToken, verifyRole(["vendor"]
   return res.json({ url: session.url, sessionId: session.id });
 }));
 
-// Protect transaction immutability at API layer
+//Protect transaction immutability at API layer
 app.all("/admin/transactions/:id", verifyToken, verifyRole(["admin"]), (req, res) => {
   return jsonError(res, 405, "Transactions are immutable");
 });
