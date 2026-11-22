@@ -612,7 +612,7 @@ app.patch("/bookings/:id/cancel", verifyToken, verifyRole(["customer"]), asyncHa
   const updated = await collections.bookings.findOne({ _id: booking._id });
   return res.json(updated);
 }));
-// ADMIN
+// ADMIN --> 
 app.get("/admin/stats", verifyToken, verifyRole(["admin"]), asyncHandler(async (req, res) => {
   const [totalUsers, totalVendors, totalCustomers, totalServices, pendingServices, approvedServices, rejectedServices, totalBookings, totalTransactions, revenueAgg] = await Promise.all([
     collections.users.countDocuments(),
