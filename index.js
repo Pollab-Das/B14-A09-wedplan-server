@@ -219,7 +219,7 @@ function isCompletedCheckoutSession(session) {
   return true;
 }
 
-// Stripe webhook must be before express.json files
+// Stripe webhook must be before express.json file
 app.post("/payments/webhook", express.raw({ type: () => true }), asyncHandler(async (req, res) => {
   if (!ensureStripe(res)) return;
   const sig = req.headers["stripe-signature"];
